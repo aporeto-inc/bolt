@@ -49,6 +49,11 @@ func fdatasync(db *DB) error {
 
 // flock acquires an advisory lock on a file descriptor.
 func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) error {
+	// mheese: this is the hack for the `containermetadata` package in the enforcer
+	if db.readOnly {
+		return nil
+	}
+
 	// Create a separate lock file on windows because a process
 	// cannot share an exclusive lock on the same file. This is
 	// needed during Tx.WriteTo().
@@ -87,6 +92,11 @@ func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) erro
 
 // funlock releases an advisory lock on a file descriptor.
 func funlock(db *DB) error {
+	// mheese: this is the hack for the `containermetadata` package in the enforcer
+	if db.readOnly {
+		return nil
+	}
+
 	err := unlockFileEx(syscall.Handle(db.lockfile.Fd()), 0, 1, 0, &syscall.Overlapped{})
 	db.lockfile.Close()
 	os.Remove(db.path + lockExt)

@@ -12,6 +12,11 @@ import (
 
 // flock acquires an advisory lock on a file descriptor.
 func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) error {
+	// mheese: this is the hack for the `containermetadata` package in the enforcer
+	if db.readOnly {
+		return nil
+	}
+
 	var t time.Time
 	for {
 		// If we're beyond our timeout then return an error.
@@ -41,6 +46,10 @@ func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) erro
 
 // funlock releases an advisory lock on a file descriptor.
 func funlock(db *DB) error {
+	// mheese: this is the hack for the `containermetadata` package in the enforcer
+	if db.readOnly {
+		return nil
+	}
 	return syscall.Flock(int(db.file.Fd()), syscall.LOCK_UN)
 }
 
