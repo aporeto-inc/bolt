@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"syscall"
-	"time"
 	"unsafe"
 )
 
@@ -25,83 +24,6 @@ const (
 	// see https://msdn.microsoft.com/en-us/library/windows/desktop/ms681382(v=vs.85).aspx
 	errLockViolation syscall.Errno = 0x21
 )
-
-func lockFileEx(h syscall.Handle, flags, reserved, locklow, lockhigh uint32, ol *syscall.Overlapped) (err error) {
-	r, _, err := procLockFileEx.Call(uintptr(h), uintptr(flags), uintptr(reserved), uintptr(locklow), uintptr(lockhigh), uintptr(unsafe.Pointer(ol)))
-	if r == 0 {
-		return err
-	}
-	return nil
-}
-
-func unlockFileEx(h syscall.Handle, reserved, locklow, lockhigh uint32, ol *syscall.Overlapped) (err error) {
-	r, _, err := procUnlockFileEx.Call(uintptr(h), uintptr(reserved), uintptr(locklow), uintptr(lockhigh), uintptr(unsafe.Pointer(ol)), 0)
-	if r == 0 {
-		return err
-	}
-	return nil
-}
-
-// fdatasync flushes written data to a file descriptor.
-func fdatasync(db *DB) error {
-	return db.file.Sync()
-}
-
-// flock acquires an advisory lock on a file descriptor.
-func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) error {
-	// mheese: this is the hack for the `containermetadata` package in the enforcer
-	if db.readOnly {
-		return nil
-	}
-
-	// Create a separate lock file on windows because a process
-	// cannot share an exclusive lock on the same file. This is
-	// needed during Tx.WriteTo().
-	f, err := os.OpenFile(db.path+lockExt, os.O_CREATE, mode)
-	if err != nil {
-		return err
-	}
-	db.lockfile = f
-
-	var t time.Time
-	for {
-		// If we're beyond our timeout then return an error.
-		// This can only occur after we've attempted a flock once.
-		if t.IsZero() {
-			t = time.Now()
-		} else if timeout > 0 && time.Since(t) > timeout {
-			return ErrTimeout
-		}
-
-		var flag uint32 = flagLockFailImmediately
-		if exclusive {
-			flag |= flagLockExclusive
-		}
-
-		err := lockFileEx(syscall.Handle(db.lockfile.Fd()), flag, 0, 1, 0, &syscall.Overlapped{})
-		if err == nil {
-			return nil
-		} else if err != errLockViolation {
-			return err
-		}
-
-		// Wait for a bit and try again.
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
-// funlock releases an advisory lock on a file descriptor.
-func funlock(db *DB) error {
-	// mheese: this is the hack for the `containermetadata` package in the enforcer
-	if db.readOnly {
-		return nil
-	}
-
-	err := unlockFileEx(syscall.Handle(db.lockfile.Fd()), 0, 1, 0, &syscall.Overlapped{})
-	db.lockfile.Close()
-	os.Remove(db.path + lockExt)
-	return err
-}
 
 // mmap memory maps a DB's data file.
 // Based on: https://github.com/edsrzf/mmap-go

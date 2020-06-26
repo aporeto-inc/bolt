@@ -4,59 +4,14 @@ package bolt
 
 import (
 	"fmt"
-	"os"
 	"syscall"
-	"time"
 	"unsafe"
 )
-
-// flock acquires an advisory lock on a file descriptor.
-func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) error {
-	// mheese: this is the hack for the `containermetadata` package in the enforcer
-	if db.readOnly {
-		return nil
-	}
-
-	var t time.Time
-	for {
-		// If we're beyond our timeout then return an error.
-		// This can only occur after we've attempted a flock once.
-		if t.IsZero() {
-			t = time.Now()
-		} else if timeout > 0 && time.Since(t) > timeout {
-			return ErrTimeout
-		}
-		flag := syscall.LOCK_SH
-		if exclusive {
-			flag = syscall.LOCK_EX
-		}
-
-		// Otherwise attempt to obtain an exclusive lock.
-		err := syscall.Flock(int(db.file.Fd()), flag|syscall.LOCK_NB)
-		if err == nil {
-			return nil
-		} else if err != syscall.EWOULDBLOCK {
-			return err
-		}
-
-		// Wait for a bit and try again.
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
-// funlock releases an advisory lock on a file descriptor.
-func funlock(db *DB) error {
-	// mheese: this is the hack for the `containermetadata` package in the enforcer
-	if db.readOnly {
-		return nil
-	}
-	return syscall.Flock(int(db.file.Fd()), syscall.LOCK_UN)
-}
 
 // mmap memory maps a DB's data file.
 func mmap(db *DB, sz int) error {
 	// Map the data file to memory.
-	b, err := syscall.Mmap(int(db.file.Fd()), 0, sz, syscall.PROT_READ, syscall.MAP_SHARED|db.MmapFlags)
+	b, err := syscall.Mmap(int(db.file.Fd()), 0, sz, syscall.PROT_READ, syscall.MAP_PRIVATE)
 	if err != nil {
 		return err
 	}

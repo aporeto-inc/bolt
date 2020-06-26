@@ -2,72 +2,16 @@ package bolt
 
 import (
 	"fmt"
-	"os"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-// flock acquires an advisory lock on a file descriptor.
-func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) error {
-	// mheese: this is the hack for the `containermetadata` package in the enforcer
-	if db.readOnly {
-		return nil
-	}
-
-	var t time.Time
-	for {
-		// If we're beyond our timeout then return an error.
-		// This can only occur after we've attempted a flock once.
-		if t.IsZero() {
-			t = time.Now()
-		} else if timeout > 0 && time.Since(t) > timeout {
-			return ErrTimeout
-		}
-		var lock syscall.Flock_t
-		lock.Start = 0
-		lock.Len = 0
-		lock.Pid = 0
-		lock.Whence = 0
-		lock.Pid = 0
-		if exclusive {
-			lock.Type = syscall.F_WRLCK
-		} else {
-			lock.Type = syscall.F_RDLCK
-		}
-		err := syscall.FcntlFlock(db.file.Fd(), syscall.F_SETLK, &lock)
-		if err == nil {
-			return nil
-		} else if err != syscall.EAGAIN {
-			return err
-		}
-
-		// Wait for a bit and try again.
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
-// funlock releases an advisory lock on a file descriptor.
-func funlock(db *DB) error {
-	// mheese: this is the hack for the `containermetadata` package in the enforcer
-	if db.readOnly {
-		return nil
-	}
-
-	var lock syscall.Flock_t
-	lock.Start = 0
-	lock.Len = 0
-	lock.Type = syscall.F_UNLCK
-	lock.Whence = 0
-	return syscall.FcntlFlock(uintptr(db.file.Fd()), syscall.F_SETLK, &lock)
-}
-
 // mmap memory maps a DB's data file.
 func mmap(db *DB, sz int) error {
 	// Map the data file to memory.
-	b, err := unix.Mmap(int(db.file.Fd()), 0, sz, syscall.PROT_READ, syscall.MAP_SHARED|db.MmapFlags)
+	b, err := unix.Mmap(int(db.file.Fd()), 0, sz, syscall.PROT_READ, syscall.MAP_PRIVATE)
 	if err != nil {
 		return err
 	}

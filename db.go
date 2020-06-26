@@ -1,10 +1,8 @@
 package bolt
 
 import (
-	"errors"
 	"fmt"
 	"hash/fnv"
-	"log"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -43,51 +41,6 @@ var defaultPageSize = os.Getpagesize()
 // All data access is performed through transactions which can be obtained through the DB.
 // All the functions on DB will return a ErrDatabaseNotOpen if accessed before Open() is called.
 type DB struct {
-	// When enabled, the database will perform a Check() after every commit.
-	// A panic is issued if the database is in an inconsistent state. This
-	// flag has a large performance impact so it should only be used for
-	// debugging purposes.
-	StrictMode bool
-
-	// Setting the NoSync flag will cause the database to skip fsync()
-	// calls after each commit. This can be useful when bulk loading data
-	// into a database and you can restart the bulk load in the event of
-	// a system failure or database corruption. Do not set this flag for
-	// normal use.
-	//
-	// If the package global IgnoreNoSync constant is true, this value is
-	// ignored.  See the comment on that constant for more details.
-	//
-	// THIS IS UNSAFE. PLEASE USE WITH CAUTION.
-	NoSync bool
-
-	// When true, skips the truncate call when growing the database.
-	// Setting this to true is only safe on non-ext3/ext4 systems.
-	// Skipping truncation avoids preallocation of hard drive space and
-	// bypasses a truncate() and fsync() syscall on remapping.
-	//
-	// https://github.com/aporeto-inc/bolt/issues/284
-	NoGrowSync bool
-
-	// If you want to read the entire database fast, you can set MmapFlag to
-	// syscall.MAP_POPULATE on Linux 2.6.23+ for sequential read-ahead.
-	MmapFlags int
-
-	// MaxBatchSize is the maximum size of a batch. Default value is
-	// copied from DefaultMaxBatchSize in Open.
-	//
-	// If <=0, disables batching.
-	//
-	// Do not change concurrently with calls to Batch.
-	MaxBatchSize int
-
-	// MaxBatchDelay is the maximum delay before a batch starts.
-	// Default value is copied from DefaultMaxBatchDelay in Open.
-	//
-	// If <=0, effectively disables batching.
-	//
-	// Do not change concurrently with calls to Batch.
-	MaxBatchDelay time.Duration
 
 	// AllocSize is the amount of space allocated when the database
 	// needs to create new pages. This is done to amortize the cost
@@ -113,7 +66,6 @@ type DB struct {
 	pagePool sync.Pool
 
 	batchMu sync.Mutex
-	batch   *batch
 
 	rwlock   sync.Mutex   // Allows only one writer at a time.
 	metalock sync.Mutex   // Protects meta page access.
@@ -147,43 +99,27 @@ func (db *DB) String() string {
 // Open creates and opens a database at the given path.
 // If the file does not exist then it will be created automatically.
 // Passing in nil options will cause Bolt to open the database with the default options.
-func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
+func Open(path string, options *Options) (*DB, error) {
 	var db = &DB{opened: true}
 
 	// Set default options if no options are provided.
 	if options == nil {
 		options = DefaultOptions
 	}
-	db.NoGrowSync = options.NoGrowSync
-	db.MmapFlags = options.MmapFlags
 
 	// Set default values for later DB operations.
-	db.MaxBatchSize = DefaultMaxBatchSize
-	db.MaxBatchDelay = DefaultMaxBatchDelay
 	db.AllocSize = DefaultAllocSize
 
-	flag := os.O_RDWR
-	if options.ReadOnly {
-		flag = os.O_RDONLY
-		db.readOnly = true
+	if !options.ReadOnly {
+		return nil, fmt.Errorf("this package only supports read-only connections. Use the official \"github.com/boltdb/bolt\" package if you need that.")
 	}
+	db.readOnly = true
 
 	// Open data file and separate sync handler for metadata writes.
 	db.path = path
 	var err error
-	if db.file, err = os.OpenFile(db.path, flag|os.O_CREATE, mode); err != nil {
-		_ = db.close()
-		return nil, err
-	}
 
-	// Lock file so that other processes using Bolt in read-write mode cannot
-	// use the database  at the same time. This would cause corruption since
-	// the two processes would write meta pages and free pages separately.
-	// The database file is locked exclusively (only one process can grab the lock)
-	// if !options.ReadOnly.
-	// The database file is locked using the shared lock (more than one process may
-	// hold a lock at the same time) otherwise (options.ReadOnly is set).
-	if err := flock(db, mode, !db.readOnly, options.Timeout); err != nil {
+	if db.file, err = os.Open(db.path); err != nil {
 		_ = db.close()
 		return nil, err
 	}
@@ -195,10 +131,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if info, err := db.file.Stat(); err != nil {
 		return nil, err
 	} else if info.Size() == 0 {
-		// Initialize new files with meta pages.
-		if err := db.init(); err != nil {
-			return nil, err
-		}
+		return nil, fmt.Errorf("DB file is empty")
 	} else {
 		// Read the first meta page to determine the page size.
 		var buf [0x1000]byte
@@ -339,53 +272,6 @@ func (db *DB) mmapSize(size int) (int, error) {
 	return int(sz), nil
 }
 
-// init creates a new database file and initializes its meta pages.
-func (db *DB) init() error {
-	// Set the page size to the OS page size.
-	db.pageSize = os.Getpagesize()
-
-	// Create two meta pages on a buffer.
-	buf := make([]byte, db.pageSize*4)
-	for i := 0; i < 2; i++ {
-		p := db.pageInBuffer(buf[:], pgid(i))
-		p.id = pgid(i)
-		p.flags = metaPageFlag
-
-		// Initialize the meta page.
-		m := p.meta()
-		m.magic = magic
-		m.version = version
-		m.pageSize = uint32(db.pageSize)
-		m.freelist = 2
-		m.root = bucket{root: 3}
-		m.pgid = 4
-		m.txid = txid(i)
-		m.checksum = m.sum64()
-	}
-
-	// Write an empty freelist at page 3.
-	p := db.pageInBuffer(buf[:], pgid(2))
-	p.id = pgid(2)
-	p.flags = freelistPageFlag
-	p.count = 0
-
-	// Write an empty leaf page at page 4.
-	p = db.pageInBuffer(buf[:], pgid(3))
-	p.id = pgid(3)
-	p.flags = leafPageFlag
-	p.count = 0
-
-	// Write the buffer to our data file.
-	if _, err := db.ops.writeAt(buf, 0); err != nil {
-		return err
-	}
-	if err := fdatasync(db); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // Close releases all database resources.
 // All transactions must be closed before closing the database.
 func (db *DB) Close() error {
@@ -420,14 +306,6 @@ func (db *DB) close() error {
 
 	// Close file handles.
 	if db.file != nil {
-		// No need to unlock read-only file.
-		if !db.readOnly {
-			// Unlock the file.
-			if err := funlock(db); err != nil {
-				log.Printf("bolt.Close(): funlock error: %s", err)
-			}
-		}
-
 		// Close the file descriptor.
 		if err := db.file.Close(); err != nil {
 			return fmt.Errorf("db file close: %s", err)
@@ -456,10 +334,7 @@ func (db *DB) close() error {
 //
 // IMPORTANT: You must close read-only transactions after you are finished or
 // else the database will not reclaim old pages.
-func (db *DB) Begin(writable bool) (*Tx, error) {
-	if writable {
-		return db.beginRWTx()
-	}
+func (db *DB) Begin() (*Tx, error) {
 	return db.beginTx()
 }
 
@@ -501,46 +376,6 @@ func (db *DB) beginTx() (*Tx, error) {
 	return t, nil
 }
 
-func (db *DB) beginRWTx() (*Tx, error) {
-	// If the database was opened with Options.ReadOnly, return an error.
-	if db.readOnly {
-		return nil, ErrDatabaseReadOnly
-	}
-
-	// Obtain writer lock. This is released by the transaction when it closes.
-	// This enforces only one writer transaction at a time.
-	db.rwlock.Lock()
-
-	// Once we have the writer lock then we can lock the meta pages so that
-	// we can set up the transaction.
-	db.metalock.Lock()
-	defer db.metalock.Unlock()
-
-	// Exit if the database is not open yet.
-	if !db.opened {
-		db.rwlock.Unlock()
-		return nil, ErrDatabaseNotOpen
-	}
-
-	// Create a transaction associated with the database.
-	t := &Tx{writable: true}
-	t.init(db)
-	db.rwtx = t
-
-	// Free any pages associated with closed read-only transactions.
-	var minid txid = 0xFFFFFFFFFFFFFFFF
-	for _, t := range db.txs {
-		if t.meta.txid < minid {
-			minid = t.meta.txid
-		}
-	}
-	if minid > 0 {
-		db.freelist.release(minid - 1)
-	}
-
-	return t, nil
-}
-
 // removeTx removes a transaction from the database.
 func (db *DB) removeTx(tx *Tx) {
 	// Release the read lock on the mmap.
@@ -571,46 +406,12 @@ func (db *DB) removeTx(tx *Tx) {
 	db.statlock.Unlock()
 }
 
-// Update executes a function within the context of a read-write managed transaction.
-// If no error is returned from the function then the transaction is committed.
-// If an error is returned then the entire transaction is rolled back.
-// Any error that is returned from the function or returned from the commit is
-// returned from the Update() method.
-//
-// Attempting to manually commit or rollback within the function will cause a panic.
-func (db *DB) Update(fn func(*Tx) error) error {
-	t, err := db.Begin(true)
-	if err != nil {
-		return err
-	}
-
-	// Make sure the transaction rolls back in the event of a panic.
-	defer func() {
-		if t.db != nil {
-			t.rollback()
-		}
-	}()
-
-	// Mark as a managed tx so that the inner function cannot manually commit.
-	t.managed = true
-
-	// If an error is returned from the function then rollback and return error.
-	err = fn(t)
-	t.managed = false
-	if err != nil {
-		_ = t.Rollback()
-		return err
-	}
-
-	return t.Commit()
-}
-
 // View executes a function within the context of a managed read-only transaction.
 // Any error that is returned from the function is returned from the View() method.
 //
 // Attempting to manually rollback within the function will cause a panic.
 func (db *DB) View(fn func(*Tx) error) error {
-	t, err := db.Begin(false)
+	t, err := db.Begin()
 	if err != nil {
 		return err
 	}
@@ -640,114 +441,6 @@ func (db *DB) View(fn func(*Tx) error) error {
 	return nil
 }
 
-// Batch calls fn as part of a batch. It behaves similar to Update,
-// except:
-//
-// 1. concurrent Batch calls can be combined into a single Bolt
-// transaction.
-//
-// 2. the function passed to Batch may be called multiple times,
-// regardless of whether it returns error or not.
-//
-// This means that Batch function side effects must be idempotent and
-// take permanent effect only after a successful return is seen in
-// caller.
-//
-// The maximum batch size and delay can be adjusted with DB.MaxBatchSize
-// and DB.MaxBatchDelay, respectively.
-//
-// Batch is only useful when there are multiple goroutines calling it.
-func (db *DB) Batch(fn func(*Tx) error) error {
-	errCh := make(chan error, 1)
-
-	db.batchMu.Lock()
-	if (db.batch == nil) || (db.batch != nil && len(db.batch.calls) >= db.MaxBatchSize) {
-		// There is no existing batch, or the existing batch is full; start a new one.
-		db.batch = &batch{
-			db: db,
-		}
-		db.batch.timer = time.AfterFunc(db.MaxBatchDelay, db.batch.trigger)
-	}
-	db.batch.calls = append(db.batch.calls, call{fn: fn, err: errCh})
-	if len(db.batch.calls) >= db.MaxBatchSize {
-		// wake up batch, it's ready to run
-		go db.batch.trigger()
-	}
-	db.batchMu.Unlock()
-
-	err := <-errCh
-	if err == trySolo {
-		err = db.Update(fn)
-	}
-	return err
-}
-
-type call struct {
-	fn  func(*Tx) error
-	err chan<- error
-}
-
-type batch struct {
-	db    *DB
-	timer *time.Timer
-	start sync.Once
-	calls []call
-}
-
-// trigger runs the batch if it hasn't already been run.
-func (b *batch) trigger() {
-	b.start.Do(b.run)
-}
-
-// run performs the transactions in the batch and communicates results
-// back to DB.Batch.
-func (b *batch) run() {
-	b.db.batchMu.Lock()
-	b.timer.Stop()
-	// Make sure no new work is added to this batch, but don't break
-	// other batches.
-	if b.db.batch == b {
-		b.db.batch = nil
-	}
-	b.db.batchMu.Unlock()
-
-retry:
-	for len(b.calls) > 0 {
-		var failIdx = -1
-		err := b.db.Update(func(tx *Tx) error {
-			for i, c := range b.calls {
-				if err := safelyCall(c.fn, tx); err != nil {
-					failIdx = i
-					return err
-				}
-			}
-			return nil
-		})
-
-		if failIdx >= 0 {
-			// take the failing transaction out of the batch. it's
-			// safe to shorten b.calls here because db.batch no longer
-			// points to us, and we hold the mutex anyway.
-			c := b.calls[failIdx]
-			b.calls[failIdx], b.calls = b.calls[len(b.calls)-1], b.calls[:len(b.calls)-1]
-			// tell the submitter re-run it solo, continue with the rest of the batch
-			c.err <- trySolo
-			continue retry
-		}
-
-		// pass success, or bolt internal errors, to all callers
-		for _, c := range b.calls {
-			c.err <- err
-		}
-		break retry
-	}
-}
-
-// trySolo is a special sentinel error value used for signaling that a
-// transaction function should be re-run. It should never be seen by
-// callers.
-var trySolo = errors.New("batch function returned an error and should be re-run solo")
-
 type panicked struct {
 	reason interface{}
 }
@@ -767,12 +460,6 @@ func safelyCall(fn func(*Tx) error, tx *Tx) (err error) {
 	}()
 	return fn(tx)
 }
-
-// Sync executes fdatasync() against the database file handle.
-//
-// This is not necessary under normal operation, however, if you use NoSync
-// then it allows you to force the database file to sync against the disk.
-func (db *DB) Sync() error { return fdatasync(db) }
 
 // Stats retrieves ongoing performance stats for the database.
 // This is only updated when a transaction closes.
@@ -855,38 +542,6 @@ func (db *DB) allocate(count int) (*page, error) {
 	return p, nil
 }
 
-// grow grows the size of the database to the given sz.
-func (db *DB) grow(sz int) error {
-	// Ignore if the new size is less than available file size.
-	if sz <= db.filesz {
-		return nil
-	}
-
-	// If the data is smaller than the alloc size then only allocate what's needed.
-	// Once it goes over the allocation size then allocate in chunks.
-	if db.datasz < db.AllocSize {
-		sz = db.datasz
-	} else {
-		sz += db.AllocSize
-	}
-
-	// Truncate and fsync to ensure file size metadata is flushed.
-	// https://github.com/aporeto-inc/bolt/issues/284
-	if !db.NoGrowSync && !db.readOnly {
-		if runtime.GOOS != "windows" {
-			if err := db.file.Truncate(int64(sz)); err != nil {
-				return fmt.Errorf("file resize error: %s", err)
-			}
-		}
-		if err := db.file.Sync(); err != nil {
-			return fmt.Errorf("file sync error: %s", err)
-		}
-	}
-
-	db.filesz = sz
-	return nil
-}
-
 func (db *DB) IsReadOnly() bool {
 	return db.readOnly
 }
@@ -905,9 +560,6 @@ type Options struct {
 	// grab a shared lock (UNIX).
 	ReadOnly bool
 
-	// Sets the DB.MmapFlags flag before memory mapping the file.
-	MmapFlags int
-
 	// InitialMmapSize is the initial mmap size of the database
 	// in bytes. Read transactions won't block write transaction
 	// if the InitialMmapSize is large enough to hold database mmap
@@ -924,6 +576,7 @@ type Options struct {
 var DefaultOptions = &Options{
 	Timeout:    0,
 	NoGrowSync: false,
+	ReadOnly:   true,
 }
 
 // Stats represents statistics about the database.

@@ -18,10 +18,3 @@ func msync(db *DB) error {
 	}
 	return nil
 }
-
-func fdatasync(db *DB) error {
-	if db.data != nil {
-		return msync(db)
-	}
-	return db.file.Sync()
-}

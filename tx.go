@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
-	"strings"
 	"time"
 	"unsafe"
 )
@@ -169,8 +167,6 @@ func (tx *Tx) Commit() error {
 	// Free the old root bucket.
 	tx.meta.root.root = tx.root.root
 
-	opgid := tx.meta.pgid
-
 	// Free the freelist and allocate new pages for it. This will overestimate
 	// the size of the freelist but not underestimate the size (which would be bad).
 	tx.db.freelist.free(tx.meta.txid, tx.db.page(tx.meta.freelist))
@@ -185,43 +181,8 @@ func (tx *Tx) Commit() error {
 	}
 	tx.meta.freelist = p.id
 
-	// If the high water mark has moved up then attempt to grow the database.
-	if tx.meta.pgid > opgid {
-		if err := tx.db.grow(int(tx.meta.pgid+1) * tx.db.pageSize); err != nil {
-			tx.rollback()
-			return err
-		}
-	}
-
 	// Write dirty pages to disk.
 	startTime = time.Now()
-	if err := tx.write(); err != nil {
-		tx.rollback()
-		return err
-	}
-
-	// If strict mode is enabled then perform a consistency check.
-	// Only the first consistency error is reported in the panic.
-	if tx.db.StrictMode {
-		ch := tx.Check()
-		var errs []string
-		for {
-			err, ok := <-ch
-			if !ok {
-				break
-			}
-			errs = append(errs, err.Error())
-		}
-		if len(errs) > 0 {
-			panic("check fail: " + strings.Join(errs, "\n"))
-		}
-	}
-
-	// Write meta to disk.
-	if err := tx.writeMeta(); err != nil {
-		tx.rollback()
-		return err
-	}
 	tx.stats.WriteTime += time.Since(startTime)
 
 	// Finalize the transaction.
@@ -468,102 +429,6 @@ func (tx *Tx) allocate(count int) (*page, error) {
 	tx.stats.PageAlloc += count * tx.db.pageSize
 
 	return p, nil
-}
-
-// write writes any dirty pages to disk.
-func (tx *Tx) write() error {
-	// Sort pages by id.
-	pages := make(pages, 0, len(tx.pages))
-	for _, p := range tx.pages {
-		pages = append(pages, p)
-	}
-	// Clear out page cache early.
-	tx.pages = make(map[pgid]*page)
-	sort.Sort(pages)
-
-	// Write pages to disk in order.
-	for _, p := range pages {
-		size := (int(p.overflow) + 1) * tx.db.pageSize
-		offset := int64(p.id) * int64(tx.db.pageSize)
-
-		// Write out page in "max allocation" sized chunks.
-		ptr := (*[maxAllocSize]byte)(unsafe.Pointer(p))
-		for {
-			// Limit our write to our max allocation size.
-			sz := size
-			if sz > maxAllocSize-1 {
-				sz = maxAllocSize - 1
-			}
-
-			// Write chunk to disk.
-			buf := ptr[:sz]
-			if _, err := tx.db.ops.writeAt(buf, offset); err != nil {
-				return err
-			}
-
-			// Update statistics.
-			tx.stats.Write++
-
-			// Exit inner for loop if we've written all the chunks.
-			size -= sz
-			if size == 0 {
-				break
-			}
-
-			// Otherwise move offset forward and move pointer to next chunk.
-			offset += int64(sz)
-			ptr = (*[maxAllocSize]byte)(unsafe.Pointer(&ptr[sz]))
-		}
-	}
-
-	// Ignore file sync if flag is set on DB.
-	if !tx.db.NoSync || IgnoreNoSync {
-		if err := fdatasync(tx.db); err != nil {
-			return err
-		}
-	}
-
-	// Put small pages back to page pool.
-	for _, p := range pages {
-		// Ignore page sizes over 1 page.
-		// These are allocated using make() instead of the page pool.
-		if int(p.overflow) != 0 {
-			continue
-		}
-
-		buf := (*[maxAllocSize]byte)(unsafe.Pointer(p))[:tx.db.pageSize]
-
-		// See https://go.googlesource.com/go/+/f03c9202c43e0abb130669852082117ca50aa9b1
-		for i := range buf {
-			buf[i] = 0
-		}
-		tx.db.pagePool.Put(buf)
-	}
-
-	return nil
-}
-
-// writeMeta writes the meta to the disk.
-func (tx *Tx) writeMeta() error {
-	// Create a temporary buffer for the meta page.
-	buf := make([]byte, tx.db.pageSize)
-	p := tx.db.pageInBuffer(buf, 0)
-	tx.meta.write(p)
-
-	// Write the meta page to file.
-	if _, err := tx.db.ops.writeAt(buf, int64(p.id)*int64(tx.db.pageSize)); err != nil {
-		return err
-	}
-	if !tx.db.NoSync || IgnoreNoSync {
-		if err := fdatasync(tx.db); err != nil {
-			return err
-		}
-	}
-
-	// Update statistics.
-	tx.stats.Write++
-
-	return nil
 }
 
 // page returns a reference to the page with a given id.
